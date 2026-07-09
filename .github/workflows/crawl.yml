@@ -1,0 +1,118 @@
+name: Crawl ITviec jobs
+
+on:
+  # 00:00 UTC = 07:00 ICT mỗi ngày
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Không chạy song song nếu user bấm Run khi còn run khác đang chạy
+concurrency:
+  group: crawl
+  cancel-in-progress: false
+
+jobs:
+  # ============ Job 1: Scrape ============
+  # Tách ra để re-run "commit" job độc lập được khi commit fail
+  # (race với user push) mà không cần scrape lại 20 phút.
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - run: npm ci
+
+      - name: Install Playwright Chromium
+        run: npx playwright install chromium --with-deps
+
+      - name: Inject login cookies
+        env:
+          COOKIES_RAW: ${{ secrets.ITVIEC_COOKIES_RAW }}
+        run: |
+          if [ -n "$COOKIES_RAW" ]; then
+            printf '%s' "$COOKIES_RAW" > cookies-raw.txt
+            node build-cookies.js
+            echo "✓ Cookies loaded"
+          else
+            echo "⚠ No ITVIEC_COOKIES_RAW secret — salary sẽ bị ẩn."
+          fi
+
+      - name: Ensure fresh state
+        run: rm -f itviec-state.json
+
+      - name: Crawl
+        run: node scraper.js
+
+      # Pass jobs.json sang job commit qua artifact. Luôn upload (success + fail)
+      # để re-run commit job có sẵn data.
+      - name: Upload jobs.json artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: itviec-jobs
+          path: itviec-jobs.json
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Upload debug artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: crawl-debug-${{ github.run_id }}
+          path: |
+            itviec-state.json
+            itviec-jobs.json
+          if-no-files-found: ignore
+          retention-days: 7
+
+  # ============ Job 2: Commit ============
+  # Chỉ làm 1 việc: checkout repo, pull artifact, git add/commit/push với retry.
+  # Nếu fail → user vào Actions tab → "Re-run failed jobs" → chỉ job này chạy lại,
+  # không scrape lại.
+  commit:
+    needs: scrape
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download jobs.json artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: itviec-jobs
+
+      - name: Commit updated jobs.json
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -z "$(git status --porcelain itviec-jobs.json)" ]; then
+            echo "No changes in itviec-jobs.json, nothing to commit."
+            exit 0
+          fi
+          git add itviec-jobs.json
+          git commit -m "chore: crawl $(date -u +%Y-%m-%d) [skip ci]"
+          # Rebase trước khi push: user có thể đã push commit khác lên main
+          # giữa lúc scrape chạy. `if` wrapper để bash -e không abort sớm.
+          for i in 1 2 3; do
+            echo "=== Push attempt $i ==="
+            git fetch origin main
+            if git pull --rebase origin main && git push; then
+              echo "✓ Pushed (attempt $i)"
+              exit 0
+            fi
+            echo "⚠ Attempt $i failed, retry in 5s..."
+            sleep 5
+          done
+          echo "::error::Failed to push after 3 attempts — re-run this job only when the race with user pushes clears."
+          exit 1
